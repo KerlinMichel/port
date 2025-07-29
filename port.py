@@ -20,8 +20,8 @@ configure_parser.add_argument('-s', '--sea', required=True)
 configure_parser.add_argument('-n', '--name', required=True)
 
 configure_action_subparser = configure_parser.add_subparsers(dest='configure-action')
-configure_action_parser = configure_action_subparser.add_parser('add-pier')
-configure_action_parser.add_argument('-p', '--pier', required=True)
+configure_action_parser = configure_action_subparser.add_parser('add-ship')
+configure_action_parser.add_argument('-s', '--ship', required=True)
 
 args = parser.parse_args()
 
@@ -31,7 +31,7 @@ s3_client = utils.create_s3_client_from_dot_env(
 )
 
 _DEFAULT_CONFIG = {
-    "piers": []
+    "ships": []
 }
 
 port_exists = False
@@ -56,22 +56,22 @@ if args.command == 'create':
     else:
         print("Port already exists")
 elif args.command == 'configure':
-    if getattr(args, 'configure-action') == 'add-pier':
+    if getattr(args, 'configure-action') == 'add-ship':
         pydo_client = utils.create_pydo_client()
 
         load_balancers = pydo_client.load_balancers.list()['load_balancers']
         lb_exists = False
         for lb in load_balancers:
-            if lb['name'] == args.pier:
+            if lb['name'] == args.ship:
                 lb_exists = True
         if lb_exists is False:
             raise ValueError()
 
-        if not args.pier in config_json['piers']:
-            config_json['piers'].append(args.pier)
-            print("Added pier")
+        if not args.ship in config_json['ships']:
+            config_json['ships'].append(args.ship)
+            print("Added ship")
         else:
-            print("Pier already in port")
+            print("Ship already in port")
 
     s3_client.put_object(Body=json.dumps(config_json), 
                          Bucket='enfra_ports',

@@ -1,4 +1,6 @@
+import io
 import json
+import uuid
 
 from botocore.exceptions import ClientError
 
@@ -34,6 +36,7 @@ class Port():
                 port_authority_access_key["key_secret"]
             )
 
+        self.port_name = port_name
         self.authority_config = self.get_port_authority_config(port_name)
 
     def get_port_authority_config(self,
@@ -47,7 +50,21 @@ class Port():
                 raise LookupError(f"Port {port_name} does not exist")
             else:
                 raise e
-    
+
+    def store_cargo(self,
+                    cargo_file_name: str,
+                    cargo_file: io.BufferedIOBase,
+                    pad_lock_key_file: io.BufferedIOBase):
+        cargo_id = str(uuid.uuid4())
+
+        self.s3_client.put_object(Body=cargo_file.read(),
+                                  Bucket=f'enfra',
+                                  Key=f'ports/{self.port_name}/container_yard/{cargo_id}/{cargo_file_name}')
+
+        self.s3_client.put_object(Body=pad_lock_key_file.read(),
+                                  Bucket=f'enfra',
+                                  Key=f'ports/{self.port_name}/container_yard/{cargo_id}/pad_lock_key.sh')
+
     @classmethod
     def construct_port(cls, port_name: str, s3_client, pydo_client):
         s3_client.put_object(Bucket='enfra',

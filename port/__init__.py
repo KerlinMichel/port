@@ -69,8 +69,18 @@ class Port():
                                   Key=f'ports/{self.port_name}/container_yard/{cargo_id}/{cargo_file_name}')
 
         self.s3_client.put_object(Body=pad_lock_key_file.read(),
-                                  Bucket=f'enfra',
+                                  Bucket='enfra',
                                   Key=f'ports/{self.port_name}/container_yard/{cargo_id}/pad_lock_key.sh')
+
+    def cargo_exists(self, cargo_id: str):
+        try:
+            self.s3_client.head_object(Bucket='enfra',
+                                       Key=f'ports/{self.port_name}/container_yard/{cargo_id}/pad_lock_key.sh')
+            return True
+        except ClientError as e:
+            if e.response['Error']['Code'] == "404":
+                return False
+            raise e
 
     def create_cargo_manifest(self, cargo_manifest_name: str):
         self.authority_config = self.get_port_authority_config(self.port_name)
@@ -81,6 +91,9 @@ class Port():
         self.update_port_authority_config()
 
     def update_cargo_mainfest(self, cargo_manifest_name: str, cargo_ids: list[str]):
+        if not all(self.cargo_exists(cargo_id) for cargo_id in cargo_ids):
+            raise ValueError("Non-existant cargo id detect")
+
         self.authority_config = self.get_port_authority_config(self.port_name)
         cargo_manifest = self.authority_config["cargo_manifests"][cargo_manifest_name]
         cargo_manifest["cargo_ids"] = cargo_ids

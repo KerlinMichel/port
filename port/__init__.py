@@ -8,7 +8,8 @@ from port import utils
 
 
 _DEFAULT_PORT_CONFIG = {
-    "cargo_manifests": {}
+    "cargo_manifests": {},
+    "fleets": {}
 }
 
 _DIGITALOCEAN_ENDPOINT_URL_FORMAT = "https://{sea}.{ocean}.digitaloceanspaces.com"
@@ -38,6 +39,7 @@ class Port():
                 port_authority_access_key["key_secret"]
             )
 
+        self.ocean = ocean
         self.port_name = port_name
         self.authority_config = self.get_port_authority_config(port_name)
 
@@ -110,5 +112,90 @@ class Port():
             body={
                 "name": port_name,
                 "purpose": "Service or API",
+            }
+        )
+
+class Fleet():
+    def __init__(self, port: Port, fleet_name: str):
+        self.port = port
+        self.fleet_name = fleet_name
+        try:
+            self.fleet_organization = self.port.authority_config[fleet_name]
+        except KeyError:
+            raise LookupError(f"No fleet named {fleet_name} in port {port.port_name}")
+
+    @classmethod
+    def construct_fleet(cls,
+                        port_of_fleet: Port,
+                        fleet_name: str,
+                        pydo_client,
+                        ship_type: str,
+                        crew: str,
+                        captain: str,
+                        ssh_key_fingerprint: str,
+                        reinforcement_strategy: str, # when to scale up resource:threshold_to_trigger_scale_up (e.g cpu:0.5, mem:0.7)
+                        gangways: list[dict], # [{"pier_end": {"type": "HTTP" | ..., "number": int}, "ship_end": {"type": "HTTP" | ..., "number": int}, "purser"?: $id_to_ssl_certificate}]
+                        min_size=1,
+                        max_size=2,):
+        fleet_call_sign = f"{port_of_fleet.port_name}-{fleet_name}"
+
+        port_of_fleet.authority_config["fleets"][fleet_name] = {
+            "fleet_call_sign": fleet_call_sign,
+            "ship_type": ship_type,
+            "crew": crew,
+            "captain": captain,
+            "min_size": min_size,
+            "max_size": max_size,
+            "reinforcement_strategy": reinforcement_strategy
+        }
+
+        # TODO: handle memory resource and perform better value validation
+        def reinforcement_strategy_to_do_config(reinforcement_strategy: str):
+            reinforcement_strategy_parts = reinforcement_strategy.split(':')
+            resource_type = reinforcement_strategy_parts[0]
+            resource_threshold = reinforcement_strategy_parts[1]
+            if resource_type == 'cpu':
+                return {"target_cpu_utilization": float(resource_threshold)}
+            raise ValueError(f"Can't parse {reinforcement_strategy} as a reinforcement strategy")
+
+        asp_resp = pydo_client.autoscalepools.create(
+            body={
+                "name": fleet_call_sign,
+                "config": {
+                    "min_instances": min_size,
+                    "max_instances": max_size,
+                    **reinforcement_strategy_to_do_config(reinforcement_strategy)
+                },
+                "droplet_template": {
+                    "name": fleet_call_sign,
+                    "region": port_of_fleet.ocean,
+                    "image": crew,
+                    "size": ship_type,
+                    "ssh_keys": [ssh_key_fingerprint],
+                    "tags": [fleet_call_sign]
+                }
+            }
+        )
+
+        def gangway_to_forwarding_rule(gangway: dict):
+            if "purser" in gangway:
+                ssl_cert_config = {"tls_passthrough": True, "certificate_id": gangway["purser"]}
+            else:
+                ssl_cert_config = {"tls_passthrough": False}
+
+            return {
+                "entry_protocol": gangway["pier_end"]["type"],
+                "entry_port": gangway["pier_end"]["number"],
+                "target_protocol": gangway["ship_end"]["type"],
+                "target_port": gangway["ship_end"]["number"],
+                **ssl_cert_config
+            }
+
+        lb_resp = pydo_client.load_balancers.create(
+            body={
+                "name": fleet_call_sign,
+                "region": port_of_fleet.ocean,
+                "forwarding_rules": list(map(gangway_to_forwarding_rule, gangways)),
+                "tag": fleet_call_sign
             }
         )

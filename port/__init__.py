@@ -2,24 +2,27 @@ import io
 import json
 import uuid
 
+import pydo
 from botocore.exceptions import ClientError
 
 from port import utils
 
 
-_DEFAULT_PORT_CONFIG = {
-    "cargo_manifests": {},
-    "fleets": {}
-}
-
 _DIGITALOCEAN_ENDPOINT_URL_FORMAT = "https://{sea}.{ocean}.digitaloceanspaces.com"
 
 class Port():
+    pydo_client: pydo.Client = utils.create_pydo_client()
+
     def __init__(self,
                  ocean: str, # region name
                  sea: str, # Spaces name
                  port_name: str,
-                 port_authority_access_key: dict=None):
+                 port_authority_access_key: dict=None,
+                 cargo_manifests: dict={},
+                 fleet_orgs: dict={}):
+        self.ocean = ocean
+        self.port_name = port_name
+
         if port_authority_access_key == None:
             self.s3_client = utils.create_s3_client_from_dot_env(
                 ocean,
@@ -39,9 +42,38 @@ class Port():
                 port_authority_access_key["key_secret"]
             )
 
-        self.ocean = ocean
-        self.port_name = port_name
-        self.authority_config = self.get_port_authority_config(port_name)
+        pl_res = Port.pydo_client.projects.list()
+        projects_by_name = [project for project in pl_res["projects"] if project["name"] == port_name]
+        if len(projects_by_name) == 0:
+            project_create_res = Port.pydo_client.projects.create(
+                body={
+                    "name": port_name,
+                    "purpose": "Service or API",
+                }
+            )
+            self.project = project_create_res["project"]
+        elif len(projects_by_name) == 1:
+            self.project = projects_by_name[0]
+        elif len(projects_by_name) > 1:
+            raise RuntimeError(f"Multiple projects with name: {port_name}")
+
+        self.cargo_manifests = {}
+        for cargo_manifest_name in cargo_manifests:
+            cargo_ids = cargo_manifests[cargo_manifest_name]
+            if cargo_ids == "$CARGO_IDS":
+                try:
+                    self.cargo_manifests[cargo_manifest_name] = self.get_cargo_manifest(cargo_manifest_name)
+                except LookupError:
+                    self.update_cargo_mainfest(cargo_manifest_name, [])
+                    self.cargo_manifests[cargo_manifest_name] = []
+            else:
+                # TODO: handle this path
+                raise NotImplementedError("Currently not supporting cargo manifests with hard coded cargo ids in port org json")
+
+        self.fleets = {}
+        for fleet_name in fleet_orgs:
+            fleet_org = fleet_orgs[fleet_name]
+            self.fleets[fleet_name] = Fleet(self, fleet_name, fleet_org)
 
     def get_port_authority_config(self,
                                   port_name: str) -> dict:
@@ -84,6 +116,22 @@ class Port():
                 return False
             raise e
 
+    def get_cargo_manifest(self, cargo_manifest_name: str):
+        try:
+            config_json_s3_res = self.s3_client.get_object(Bucket='ports',
+                                                           Key=f'{self.port_name}/cargo_manifests/{cargo_manifest_name}/manifest.json')
+            return json.load(config_json_s3_res['Body'])
+        except ClientError as e:
+            if e.response['Error']['Code'] == "NoSuchKey":
+                raise LookupError(f"Cargo manifest {cargo_manifest_name} does not exist")
+            else:
+                raise e
+
+    def update_cargo_mainfest(self, cargo_manifest_name: str, cargo_ids: list[str]):
+        self.s3_client.put_object(Body=json.dumps(cargo_ids),
+                                  Bucket=f'ports',
+                                  Key=f'{self.port_name}/cargo_manifests/{cargo_manifest_name}/manifest.json')
+
     def create_cargo_manifest(self, cargo_manifest_name: str):
         self.authority_config = self.get_port_authority_config(self.port_name)
         self.authority_config["cargo_manifests"][cargo_manifest_name] = {
@@ -92,110 +140,98 @@ class Port():
 
         self.update_port_authority_config()
 
-    def update_cargo_mainfest(self, cargo_manifest_name: str, cargo_ids: list[str]):
-        if not all(self.cargo_exists(cargo_id) for cargo_id in cargo_ids):
-            raise ValueError("Non-existant cargo id detect")
-
-        self.authority_config = self.get_port_authority_config(self.port_name)
-        cargo_manifest = self.authority_config["cargo_manifests"][cargo_manifest_name]
-        cargo_manifest["cargo_ids"] = cargo_ids
-        self.authority_config["cargo_manifests"][cargo_manifest_name] = cargo_manifest
-        self.update_port_authority_config()
-
     @classmethod
-    def construct_port(cls, port_name: str, s3_client, pydo_client):
-        s3_client.put_object(Bucket='enfra',
-                             Key=f'ports/{port_name}/port_authority_config.json',
-                             Body=json.dumps(_DEFAULT_PORT_CONFIG))
-
-        pydo_client.projects.create(
-            body={
-                "name": port_name,
-                "purpose": "Service or API",
-            }
+    def load_from_port_org(cls, port_org: dict):
+        return Port(
+            port_org["ocean"],
+            port_org["sea"],
+            port_org["port_name"],
+            cargo_manifests=port_org["cargo_manifests"],
+            fleet_orgs=port_org["fleets"]
         )
 
 class Fleet():
-    def __init__(self, port: Port, fleet_name: str):
+    def __init__(self, port: Port, fleet_name: str, fleet_org: dict):
         self.port = port
         self.fleet_name = fleet_name
-        try:
-            self.fleet_organization = self.port.authority_config[fleet_name]
-        except KeyError:
-            raise LookupError(f"No fleet named {fleet_name} in port {port.port_name}")
+        self.fleet_call_sign = f"{port.port_name}-{fleet_name}"
 
-    @classmethod
-    def construct_fleet(cls,
-                        port_of_fleet: Port,
-                        fleet_name: str,
-                        pydo_client,
-                        ship_type: str,
-                        crew: str,
-                        captain: str,
-                        ssh_key_fingerprint: str,
-                        reinforcement_strategy: str, # when to scale up resource:threshold_to_trigger_scale_up (e.g cpu:0.5, mem:0.7)
-                        gangways: list[dict], # [{"pier_end": {"type": "HTTP" | ..., "number": int}, "ship_end": {"type": "HTTP" | ..., "number": int}, "purser"?: $id_to_ssl_certificate}]
-                        min_size=1,
-                        max_size=2,):
-        fleet_call_sign = f"{port_of_fleet.port_name}-{fleet_name}"
+        aspl_res = Port.pydo_client.autoscalepools.list()
+        asps_by_name = [asp for asp in aspl_res["autoscale_pools"] if asp["name"] == fleet_name]
+        if len(asps_by_name) == 0:
+            # TODO: handle memory resource and perform better value validation
+            def reinforcement_strategy_to_do_config(reinforcement_strategy: str):
+                reinforcement_strategy_parts = reinforcement_strategy.split(':')
+                resource_type = reinforcement_strategy_parts[0]
+                resource_threshold = reinforcement_strategy_parts[1]
+                if resource_type == 'cpu':
+                    return {"target_cpu_utilization": float(resource_threshold)}
+                raise ValueError(f"Can't parse {reinforcement_strategy} as a reinforcement strategy")
+            
+            if fleet_org["ssh_key_fingerprint"] == "$LOCAL":
+                fleet_org["ssh_key_fingerprint"] = utils.get_local_machine_ssh_key_fingerprint()
 
-        port_of_fleet.authority_config["fleets"][fleet_name] = {
-            "fleet_call_sign": fleet_call_sign,
-            "ship_type": ship_type,
-            "crew": crew,
-            "captain": captain,
-            "min_size": min_size,
-            "max_size": max_size,
-            "reinforcement_strategy": reinforcement_strategy
-        }
-
-        # TODO: handle memory resource and perform better value validation
-        def reinforcement_strategy_to_do_config(reinforcement_strategy: str):
-            reinforcement_strategy_parts = reinforcement_strategy.split(':')
-            resource_type = reinforcement_strategy_parts[0]
-            resource_threshold = reinforcement_strategy_parts[1]
-            if resource_type == 'cpu':
-                return {"target_cpu_utilization": float(resource_threshold)}
-            raise ValueError(f"Can't parse {reinforcement_strategy} as a reinforcement strategy")
-
-        asp_resp = pydo_client.autoscalepools.create(
-            body={
-                "name": fleet_call_sign,
-                "config": {
-                    "min_instances": min_size,
-                    "max_instances": max_size,
-                    **reinforcement_strategy_to_do_config(reinforcement_strategy)
-                },
-                "droplet_template": {
-                    "name": fleet_call_sign,
-                    "region": port_of_fleet.ocean,
-                    "image": crew,
-                    "size": ship_type,
-                    "ssh_keys": [ssh_key_fingerprint],
-                    "tags": [fleet_call_sign]
+            autoscalepool_create_res = Port.pydo_client.autoscalepools.create(
+                body={
+                    "name": self.fleet_call_sign,
+                    "config": {
+                        "min_instances": fleet_org["min_size"],
+                        "max_instances": fleet_org["max_size"],
+                        **reinforcement_strategy_to_do_config(fleet_org["reinforcement_strategy"])
+                    },
+                    "droplet_template": {
+                        "name": self.fleet_call_sign,
+                        "region": port.ocean,
+                        "image": fleet_org["crew"],
+                        "size": fleet_org["ship_type"],
+                        "ssh_keys": [fleet_org["ssh_key_fingerprint"]],
+                        "tags": [self.fleet_call_sign]
+                    }
                 }
-            }
-        )
+            )
+            autoscale_pool_id = autoscalepool_create_res["autoscale_pool"]["id"]
+            Port.pydo_client.projects.assign_resources(
+                port.project["id"],
+                body={
+                    "resources": [f"do:autoscalepool:{autoscale_pool_id}"]
+                }
+            )
+        elif len(asps_by_name) > 1:
+            raise RuntimeError(f"Multiple autoscale pools with name: {fleet_name}")
 
-        def gangway_to_forwarding_rule(gangway: dict):
-            if "purser" in gangway:
-                ssl_cert_config = {"tls_passthrough": True, "certificate_id": gangway["purser"]}
-            else:
-                ssl_cert_config = {"tls_passthrough": False}
+        lbl_res = Port.pydo_client.load_balancers.list()
+        lbs_by_name = [lb for lb in lbl_res["load_balancers"] if lb["name"] == fleet_name]
 
-            return {
-                "entry_protocol": gangway["pier_end"]["type"],
-                "entry_port": gangway["pier_end"]["number"],
-                "target_protocol": gangway["ship_end"]["type"],
-                "target_port": gangway["ship_end"]["number"],
-                **ssl_cert_config
-            }
+        if len(lbs_by_name) == 0:
+            def gangway_to_forwarding_rule(gangway: dict):
+                if "purser" in gangway:
+                    ssl_cert_config = {"tls_passthrough": True, "certificate_id": gangway["purser"]}
+                else:
+                    ssl_cert_config = {"tls_passthrough": False}
 
-        lb_resp = pydo_client.load_balancers.create(
-            body={
-                "name": fleet_call_sign,
-                "region": port_of_fleet.ocean,
-                "forwarding_rules": list(map(gangway_to_forwarding_rule, gangways)),
-                "tag": fleet_call_sign
-            }
-        )
+                return {
+                    "entry_protocol": gangway["pier_end"]["type"],
+                    "entry_port": gangway["pier_end"]["number"],
+                    "target_protocol": gangway["ship_end"]["type"],
+                    "target_port": gangway["ship_end"]["number"],
+                    **ssl_cert_config
+                }
+
+            loadbalancer_create_res = Port.pydo_client.load_balancers.create(
+                body={
+                    "name": fleet_name,
+                    "region": port.ocean,
+                    "forwarding_rules": list(map(gangway_to_forwarding_rule, fleet_org["gangways"])),
+                    "tag": self.fleet_call_sign
+                }
+            )
+
+            loadbalancer_pool_id = loadbalancer_create_res["load_balancer"]["id"]
+            Port.pydo_client.projects.assign_resources(
+                port.project["id"],
+                body={
+                    "resources": [f"do:loadbalancer:{loadbalancer_pool_id}"]
+                }
+            )
+        elif len(lbs_by_name) > 1:
+            raise RuntimeError(f"Multiple load balancers with name: {fleet_name}")

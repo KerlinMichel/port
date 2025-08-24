@@ -1,5 +1,7 @@
 import io
 import json
+import os
+import textwrap
 import uuid
 
 import pydo
@@ -150,14 +152,53 @@ class Port():
             fleet_orgs=port_org["fleets"]
         )
 
+_MARINE_RADIO_FILE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "marine_radio.go"))
+_MARINE_RADIO_FREQUENCY = 1566
+
 class Fleet():
+    with open(_MARINE_RADIO_FILE_PATH) as ship_radio_file:
+        MARINE_RADIO = ship_radio_file.read()
+
+    CLOUD_CONFIG = f"""
+#cloud-config
+packages:
+  - supervisor
+  - golang-go
+write_files:
+  - path: /ecosystem.config.js
+    content: |
+        module.exports = {{
+            apps : [{{
+                name: "marine_radio",
+                script: "/marine_radio.go",
+                interpreter: "go",
+                interpreter_args: "run"
+            }}]
+        }}
+  - path: /marine_radio.go
+    content: |
+{textwrap.indent(MARINE_RADIO, '      ')}
+  - path: /etc/supervisor/conf.d/marine_radio.conf
+    content: |
+      [supervisord]
+      environment=GOCACHE="/root/.cache/go-build"
+      [program:marine_radio]
+      command=go run /marine_radio.go
+      autostart=true
+      autorestart=true
+      startsecs=0
+runcmd:
+  - service supervisor start
+  - supervisorctl reread
+  - supervisorctl update
+""".strip()
     def __init__(self, port: Port, fleet_name: str, fleet_org: dict):
         self.port = port
         self.fleet_name = fleet_name
         self.fleet_call_sign = f"{port.port_name}-{fleet_name}"
 
         aspl_res = Port.pydo_client.autoscalepools.list()
-        asps_by_name = [asp for asp in aspl_res["autoscale_pools"] if asp["name"] == fleet_name]
+        asps_by_name = [asp for asp in aspl_res["autoscale_pools"] if asp["name"] == self.fleet_call_sign]
         if len(asps_by_name) == 0:
             # TODO: handle memory resource and perform better value validation
             def reinforcement_strategy_to_do_config(reinforcement_strategy: str):
@@ -185,22 +226,18 @@ class Fleet():
                         "image": fleet_org["crew"],
                         "size": fleet_org["ship_type"],
                         "ssh_keys": [fleet_org["ssh_key_fingerprint"]],
+                        "user_data": Fleet.CLOUD_CONFIG,
                         "tags": [self.fleet_call_sign]
                     }
                 }
             )
-            autoscale_pool_id = autoscalepool_create_res["autoscale_pool"]["id"]
-            Port.pydo_client.projects.assign_resources(
-                port.project["id"],
-                body={
-                    "resources": [f"do:autoscalepool:{autoscale_pool_id}"]
-                }
-            )
+            # TODO: look into assigning autoscaling pool to a project.
+            # Based on DigitalOcean UI it seems like autoscale pools can't be assigned to groups.
         elif len(asps_by_name) > 1:
             raise RuntimeError(f"Multiple autoscale pools with name: {fleet_name}")
 
         lbl_res = Port.pydo_client.load_balancers.list()
-        lbs_by_name = [lb for lb in lbl_res["load_balancers"] if lb["name"] == fleet_name]
+        lbs_by_name = [lb for lb in lbl_res["load_balancers"] if lb["name"] == self.fleet_call_sign]
 
         if len(lbs_by_name) == 0:
             def gangway_to_forwarding_rule(gangway: dict):
@@ -219,10 +256,19 @@ class Fleet():
 
             loadbalancer_create_res = Port.pydo_client.load_balancers.create(
                 body={
-                    "name": fleet_name,
+                    "name": self.fleet_call_sign,
                     "region": port.ocean,
                     "forwarding_rules": list(map(gangway_to_forwarding_rule, fleet_org["gangways"])),
-                    "tag": self.fleet_call_sign
+                    "tag": self.fleet_call_sign,
+                    "health_check": {
+                        "protocol": "http",
+                        "port": _MARINE_RADIO_FREQUENCY,
+                        "path": "/",
+                        "check_interval_seconds": 5,
+                        "response_timeout_seconds": 5,
+                        "unhealthy_threshold": 2,
+                        "healthy_threshold": 3
+                    }
                 }
             )
 

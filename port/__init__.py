@@ -15,6 +15,8 @@ _DIGITALOCEAN_ENDPOINT_URL_FORMAT = "https://{sea}.{ocean}.digitaloceanspaces.co
 class Port():
     pydo_client: pydo.Client = utils.create_pydo_client()
 
+    CARGO_LOADING_TEMPLATE = "curl https://{sea}.{ocean}.cdn.digitaloceanspaces.com/ports/{port}/container_yard/{cargo_id} -o /cargo_bay/{cargo_id}"
+
     def __init__(self,
                  ocean: str, # region name
                  sea: str, # Spaces name
@@ -23,6 +25,7 @@ class Port():
                  cargo_manifests: dict={},
                  fleet_orgs: dict={}):
         self.ocean = ocean
+        self.sea = sea
         self.port_name = port_name
 
         if port_authority_access_key == None:
@@ -95,18 +98,22 @@ class Port():
                                   Body=json.dumps(self.authority_config))
 
     def store_cargo(self,
-                    cargo_file_name: str,
-                    cargo_file: io.BufferedIOBase,
-                    pad_lock_key_file: io.BufferedIOBase):
+                    cargo: io.BufferedIOBase,
+                    pad_lock_key_file: io.BufferedIOBase) -> str:
+        """
+        Returns cargo id
+        """
         cargo_id = str(uuid.uuid4())
 
-        self.s3_client.put_object(Body=cargo_file.read(),
-                                  Bucket=f'enfra',
-                                  Key=f'ports/{self.port_name}/container_yard/{cargo_id}/{cargo_file_name}')
+        self.s3_client.put_object(Body=cargo.read(),
+                                  Bucket=f'ports',
+                                  Key=f'{self.port_name}/container_yard/{cargo_id}/cargo')
 
         self.s3_client.put_object(Body=pad_lock_key_file.read(),
-                                  Bucket='enfra',
-                                  Key=f'ports/{self.port_name}/container_yard/{cargo_id}/pad_lock_key.sh')
+                                  Bucket='ports',
+                                  Key=f'{self.port_name}/container_yard/{cargo_id}/pad_lock_key.sh')
+
+        return cargo_id
 
     def cargo_exists(self, cargo_id: str):
         try:
@@ -165,16 +172,6 @@ packages:
   - supervisor
   - golang-go
 write_files:
-  - path: /ecosystem.config.js
-    content: |
-        module.exports = {{
-            apps : [{{
-                name: "marine_radio",
-                script: "/marine_radio.go",
-                interpreter: "go",
-                interpreter_args: "run"
-            }}]
-        }}
   - path: /marine_radio.go
     content: |
 {textwrap.indent(MARINE_RADIO, '      ')}
@@ -188,6 +185,8 @@ write_files:
       autorestart=true
       startsecs=0
 runcmd:
+  - mkdir /cargo_bay
+  - {{load_cargo_into_cargo_bay}}
   - service supervisor start
   - supervisorctl reread
   - supervisorctl update
@@ -212,6 +211,20 @@ runcmd:
             if fleet_org["ssh_key_fingerprint"] == "$LOCAL":
                 fleet_org["ssh_key_fingerprint"] = utils.get_local_machine_ssh_key_fingerprint()
 
+            load_cargo_into_cargo_bay_commands = []
+            for cargo_manifest_name in port.cargo_manifests:
+                cargo_ids = port.cargo_manifests[cargo_manifest_name]
+                for cargo_id in cargo_ids:
+                    # TODO: make CARGO_LOADING_TEMPLATE also unlock/unzip cargo
+                    load_cargo_into_cargo_bay_commands += Port.CARGO_LOADING_TEMPLATE.format(
+                        ocean=self.port.ocean,
+                        sea=self.port.sea,
+                        port=self.port.port_name,
+                        cargo_id=cargo_id
+                    )
+            # download cargo into cargo bay in sequence
+            load_all_cargo_into_cargo_bay_command = " && ".join(load_cargo_into_cargo_bay_commands)
+
             autoscalepool_create_res = Port.pydo_client.autoscalepools.create(
                 body={
                     "name": self.fleet_call_sign,
@@ -226,7 +239,7 @@ runcmd:
                         "image": fleet_org["crew"],
                         "size": fleet_org["ship_type"],
                         "ssh_keys": [fleet_org["ssh_key_fingerprint"]],
-                        "user_data": Fleet.CLOUD_CONFIG,
+                        "user_data": Fleet.CLOUD_CONFIG.replace("{load_cargo_into_cargo_bay}", load_all_cargo_into_cargo_bay_command),
                         "tags": [self.fleet_call_sign]
                     }
                 }

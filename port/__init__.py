@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import subprocess
 import textwrap
 import uuid
 
@@ -294,3 +295,7 @@ runcmd:
             )
         elif len(lbs_by_name) > 1:
             raise RuntimeError(f"Multiple load balancers with name: {fleet_name}")
+
+class Container():
+    def __init__(self, items: list[str]):
+        subprocess.run([f"tar -czvf container.tar.gz {' '.join(items)}"] + items, shell=True)
